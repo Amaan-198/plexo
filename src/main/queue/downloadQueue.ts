@@ -262,7 +262,7 @@ export class DownloadQueue {
       result.added++
     }
     if (result.added > 0) {
-      if (options.start) this.running = true
+      if (options.start) this.run()
       this.changed()
       this.startLookups()
       this.pump()
@@ -319,7 +319,7 @@ export class DownloadQueue {
       if (item.url !== url || item.status !== 'queued') return
       const failure = classifyError(error)
       // Only a link that plainly doesn't work fails now; anything else gets its turn.
-      if (failure.problem === 'expired') this.finish(item, 'failed', failure)
+      if (failure.problem === 'expired') this.fail(item, failure)
       else item.totalBytes = 0
     }
     this.changed()
@@ -331,11 +331,16 @@ export class DownloadQueue {
     return this.items.find((item) => item.id === id)
   }
 
+  /** Sets the queue going, whatever set it off: whatever stopped it no longer stands. */
+  private run(): void {
+    this.running = true
+    this.stoppedBecause = undefined
+  }
+
   async start(): Promise<void> {
     await this.loaded
-    this.running = true
+    this.run()
     this.blocked = false
-    this.stoppedBecause = undefined
     this.changed()
     await this.enqueue(async () => {
       const current = await this.manager?.currentState()
@@ -377,8 +382,7 @@ export class DownloadQueue {
       this.requeue(item)
       item.attempts = 0
     }
-    this.running = true
-    this.stoppedBecause = undefined
+    this.run()
     this.changed()
     this.pump()
   }
@@ -474,7 +478,7 @@ export class DownloadQueue {
       // with it, rather than stopping once that file is done.
       const resumed = status === 'downloading' && (previous === 'paused' || previous === 'error')
       if (resumed && !this.running) {
-        this.running = true
+        this.run()
         this.changed()
       }
       this.applyState(item, event.state)
@@ -688,9 +692,10 @@ export class DownloadQueue {
     } catch (error) {
       if (!this.items.includes(item)) return
       const problem = folderProblem(error, this.destinationDir)
-      if (problem || (await manager.isBusy())) {
-        // Its folder can't be saved to — nor could any other item's be — or the user started a
-        // download of their own meanwhile: either way, not this item's failure. It waits.
+      if (problem || !this.running || (await manager.isBusy())) {
+        // Its folder can't be saved to — nor could any other item's be — or the queue was paused,
+        // or the user started a download of their own, meanwhile: not this item's failure. It
+        // waits.
         item.status = 'queued'
         item.attempts--
         if (problem) this.stopBecause(problem)
