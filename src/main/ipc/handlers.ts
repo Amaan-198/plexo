@@ -13,6 +13,7 @@ import {
 import { IpcChannels } from '../../shared/ipc-channels'
 import type { IpcContract } from '../../shared/ipc-contract'
 import type { InitialState, QueueCommand, ThemeSource } from '../../shared/types'
+import { BrowserBridge } from '../bridge/browserBridge'
 import { DownloadManager } from '../download/downloadManager'
 import { getDefaultDownloadsDir, getHomeDir } from '../download/paths'
 import { probeUrl } from '../download/probe'
@@ -75,6 +76,9 @@ export function registerIpcHandlers(getWindow: () => BrowserWindow | null): {
   }))
   const manager = new DownloadManager(getWindow, networks, () => queue.retainedDownloads())
   void queue.attach(manager)
+  const bridge = new BrowserBridge(queue, getWindow)
+  void bridge.start()
+  app.on('will-quit', () => bridge.stop())
   // Waking from sleep, the networks may have changed without a poll in between to see it.
   powerMonitor.on('resume', () => {
     manager.systemResumed()
@@ -191,7 +195,10 @@ export function registerIpcHandlers(getWindow: () => BrowserWindow | null): {
   })
 
   handle('addToQueue', async (_event, links, options) =>
-    queue.addLinks(Array.isArray(links) ? links : [], { start: options?.start === true })
+    queue.addLinks(Array.isArray(links) ? links : [], {
+      source: 'paste',
+      start: options?.start === true
+    })
   )
 
   handle('queueCommand', async (_event, command: QueueCommand) => {
@@ -210,8 +217,14 @@ export function registerIpcHandlers(getWindow: () => BrowserWindow | null): {
         return queue.move(command.id, command.offset === -1 ? -1 : 1)
       case 'clearFinished':
         return queue.clearFinished()
+      case 'openPage':
+        return queue.openPage(command.id)
       case 'setDestination':
         return queue.setDestination(command.dir)
+      case 'answerPair':
+        return bridge.answerPair(command.id, command.allow === true)
+      case 'forgetBrowsers':
+        return bridge.forgetBrowsers()
     }
   })
 

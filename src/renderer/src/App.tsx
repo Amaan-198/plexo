@@ -3,6 +3,7 @@ import { useEffect } from 'react'
 import { AddLinksDialog } from './components/AddLinksDialog'
 import { TitleBar, type TitleBarStatus } from './components/TitleBar'
 import { NetworkBindingDialog } from './components/NetworkBindingDialog'
+import { PairDialog } from './components/PairDialog'
 import { QueueSheet } from './components/QueueSheet'
 import { UpdateDialog } from './components/UpdateDialog'
 import { TooltipProvider } from './components/ui/tooltip'
@@ -136,6 +137,7 @@ function App(): React.JSX.Element {
         <AddLinksDialog />
         <UpdateDialog />
         <NetworkBindingDialog />
+        <PairDialog />
       </div>
     </TooltipProvider>
   )

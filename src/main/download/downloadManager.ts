@@ -16,6 +16,7 @@ import type {
   ServerRefusal,
   StartDownloadRequest
 } from '../../shared/types'
+import { seal, unseal } from '../secrets'
 import { testKnobs, testStreamsPerNetwork } from '../testKnobs'
 import { advanceBlock, retractBlock } from './blockProgress'
 import { ConcurrencyController, type Action, type Snapshot } from './concurrency'
@@ -30,6 +31,7 @@ import {
   planDownload,
   startingStreams
 } from './plan'
+import { sanitizeContext } from './requestContext'
 import { restoreBlocks, saveBlocks, type SavedBlocks } from './savedProgress'
 import { pickWork, type SchedulerPolicy, type Work } from './scheduler'
 import type { NetworkMonitor } from '../network/interfaces'
@@ -202,7 +204,8 @@ interface PersistedDownloadBase {
   partialPath: string
   publicationPath?: string
   publicationIdentity?: { dev: number; ino: number }
-  requestPayload: StartDownloadRequest
+  /** As started, but for its context (cookies), which is sealed (see secrets.ts). */
+  requestPayload: Omit<StartDownloadRequest, 'context'> & { context?: unknown }
   /** The networks, as saved before a download listed them in its state. Read only to fill in
    * `networks` for a download saved that way. */
   activeInterfaces?: NetworkInterfaceInfo[]
@@ -638,7 +641,15 @@ export class DownloadManager {
             }
           }
 
-          const runtime = newRuntime(state, persisted.requestPayload, file, blocks)
+          const runtime = newRuntime(
+            state,
+            {
+              ...persisted.requestPayload,
+              context: sanitizeContext(unseal(persisted.requestPayload.context))
+            },
+            file,
+            blocks
+          )
           runtime.publicationPath = persisted.publicationPath
           runtime.publicationIdentity = persisted.publicationIdentity
           runtime.activeAt = persisted.activeAt ?? state.startedAt
@@ -772,12 +783,15 @@ export class DownloadManager {
 
   /**
    * Resumes a parked (or failed) download as the current one, optionally from a new link to the
-   * same file — where its link redirects to now, which can change from one try to the next. A new
-   * link is first checked against a sample of the bytes on disk (see checkNewLink): one that
-   * serves something else isn't resumed from — that would mix two files — and this resolves to
-   * false, as it does whenever the download doesn't get going again.
+   * same file — a file host's session link that expired, captured again. A new link is first
+   * checked against a sample of the bytes on disk (see checkNewLink): one that serves something
+   * else isn't resumed from — that would mix two files — and this resolves to false, as it does
+   * whenever the download doesn't get going again.
    */
-  async resumeParked(id: string, source?: Pick<StartDownloadRequest, 'url'>): Promise<boolean> {
+  async resumeParked(
+    id: string,
+    source?: Pick<StartDownloadRequest, 'url' | 'context'>
+  ): Promise<boolean> {
     await this.initialization
     const runtime = this.runtimes.get(id)
     if (!runtime) return false
@@ -1734,6 +1748,7 @@ export class DownloadManager {
         createDestination: () => runtime.file.writer(block.rangeStart + (attempt.startOffset ?? 0)),
         signal: AbortSignal.any([self.controller.signal, attempt.abort.signal]),
         acceptedVersions: runtime.acceptedVersions,
+        context: runtime.requestPayload.context,
         onResponse: (info) => (attempt.response = info),
         onNetworkProgress: (bytesThisRun) => {
           const delta = bytesThisRun - attempt.networkReceived
@@ -2272,7 +2287,8 @@ export class DownloadManager {
             runtime.requestPayload.url,
             block.rangeStart,
             block.rangeStart + local.length - 1,
-            connection
+            connection,
+            runtime.requestPayload.context
           )
           // A reply from a server still presenting an accepted label proves nothing here.
           if (seen && compareVersion([seen], remote.version).kind !== 'same') continue
@@ -2384,7 +2400,14 @@ export class DownloadManager {
           partialPath: runtime.file.path,
           publicationPath: runtime.publicationPath,
           publicationIdentity: runtime.publicationIdentity,
-          requestPayload: runtime.requestPayload,
+          requestPayload: {
+            ...runtime.requestPayload,
+            // A finished download's session is no use any more: it isn't kept on disk.
+            context:
+              runtime.state.status === 'completed'
+                ? undefined
+                : seal(runtime.requestPayload.context)
+          },
           parked: runtime.parked || undefined,
           activeAt: runtime.activeAt
         }

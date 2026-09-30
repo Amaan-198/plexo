@@ -262,9 +262,19 @@ npm run dev
 Paste several links into the link field (or use **Add several links** on the start screen) and they go to the queue, opened from the list icon in the title bar. Files download **one at a time** — a single file already has every network to itself — into the queue's folder, over the networks left on at the start screen.
 
 - **Failures**: a failure a moment could fix (a busy server, a dropped connection) is retried once, a few seconds later; anything else waits for **Retry**, which picks up where it stopped. With no network connected the queue waits for one, and a save folder it can't write to (gone, read-only, full) pauses it with the reason, rather than failing every file in turn.
-- **Expired links**: a link answering `401`/`403`/`404`/`410`, or with a web page instead of the file, is marked _expired_ rather than retried.
+- **Expired links**: a link answering `401`/`403`/`404`/`410`, or with a web page instead of the file, is marked _expired_ rather than retried. For a link from the browser, **Get a new link** opens its page; its download button, clicked again, refreshes the same item, which resumes once Plexo has checked that the new link serves the same bytes.
 - **Relaunch**: the queue comes back **stopped**, with its current download paused. **Resume queue** carries on.
 - One notification when the queue runs out, rather than one per file.
+
+### Links from a browser
+
+A browser extension can send downloads to the queue with the browser's session (cookies, Referer, User-Agent) — what a file host's "secure session link" needs. Plexo listens for it on `127.0.0.1:47513` only (`PLEXO_BRIDGE_PORT` moves it). It answers only JSON POSTs carrying an extension's origin, which no web page can send, and queues downloads only from a browser allowed in Plexo's window; **Disconnect** at the bottom of the queue forgets them all.
+
+About session links:
+
+- Cookies go only where the browser would send them (domain, path, `https`), and are stored encrypted with the system's store for secrets.
+- Some file hosts tie a link to the IP address it was requested from. Then only the network that address belongs to is served; the others are marked failed, and the download finishes over that one.
+- A link can expire while it waits in the queue; refresh it as above.
 
 ---
 

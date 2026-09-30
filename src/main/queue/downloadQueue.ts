@@ -1,22 +1,25 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { app, Notification, type BrowserWindow } from 'electron'
+import { app, Notification, shell, type BrowserWindow } from 'electron'
 import { IpcChannels } from '../../shared/ipc-channels'
 import type {
   AddLinksResult,
   AppSettings,
+  BrowserBridgeState,
   DownloadState,
   DownloadStatus,
   QueueItem,
+  QueueItemProblem,
   QueueLink,
   QueueState
 } from '../../shared/types'
 import { isCancelled, isFailure, nameOf } from '../../shared/queueItem'
 import type { DownloadEvent, DownloadManager } from '../download/downloadManager'
-import { probeUrl } from '../download/probe'
+import { probeWithContext } from '../download/probe'
 import { readJson, updateJson } from '../jsonFile'
 import type { NetworkMonitor } from '../network/interfaces'
+import { seal } from '../secrets'
 import { testKnobs } from '../testKnobs'
 import {
   classifyDownload,
@@ -25,7 +28,7 @@ import {
   LinkExpiredError,
   type Failure
 } from './failures'
-import { sanitizeLink, sanitizeStoredItem } from './items'
+import { hostOf, sameName, sanitizeLink, sanitizeStoredItem, type StoredItem } from './items'
 
 /** Downloads started for an item before a failure that isn't the link's fault (a server
  * error, a dropped connection) stops being retried on its own. */
@@ -39,6 +42,20 @@ const MAX_ITEMS = 5000
 /** queue.json may be briefly locked (antivirus, a sync client): read again this many times. */
 const READ_TRIES = 5
 
+/** One queue item as the browser extension's popup shows it (see browserView). */
+export interface BrowserQueueItem {
+  id: string
+  name: string
+  status: QueueItem['status']
+  problem?: QueueItemProblem
+  totalBytes: number
+  bytesDownloaded: number
+  speedBytesPerSec: number
+  paused: boolean
+  addedAt: number
+  finishedAt?: number
+}
+
 /**
  * Plexo's download queue: links waiting their turn, downloaded one at a time — one file already
  * has every network to itself, so a second at once would only split them. Each item becomes an
@@ -48,7 +65,7 @@ const READ_TRIES = 5
  * current download paused as the manager restores it — nothing starts until the user says so.
  */
 export class DownloadQueue {
-  private items: QueueItem[] = []
+  private items: StoredItem[] = []
   private running = false
   private destinationDir = ''
   /** The current download failed outside the queue: the user moves on from it before the queue
@@ -75,6 +92,7 @@ export class DownloadQueue {
   private stoppedBecause: string | undefined
   /** Wakes the queue for the earliest automatic retry. */
   private retryTimer: NodeJS.Timeout | null = null
+  private bridge: BrowserBridgeState = { status: 'starting', port: 0, pairedCount: 0 }
   /** Tallied since the queue last had nothing to do, for the "queue finished" notification. */
   private session = { completed: 0, failed: 0, lastName: '' }
 
@@ -177,8 +195,43 @@ export class DownloadQueue {
       loadError: this.loadError,
       waitingForNetwork: this.running && this.waitingForNetwork,
       stoppedBecause: this.stoppedBecause,
-      items: this.items.map((item) => ({ ...item }))
+      items: this.items.map((item) => {
+        const view: StoredItem = { ...item }
+        delete view.context
+        return view
+      }),
+      bridge: this.bridge
     }
+  }
+
+  /** The queue as the browser extension shows it: what each item is called and where it's at,
+   * live. Nothing else — no links, paths or sessions — leaves for the browser. */
+  async browserView(): Promise<{ running: boolean; items: BrowserQueueItem[] }> {
+    await this.loaded
+    const current = await this.manager?.currentState()
+    return {
+      running: this.running,
+      items: this.items.map((item) => {
+        const live = item.status === 'active' && current?.id === item.downloadId ? current : null
+        return {
+          id: item.id,
+          name: nameOf(item),
+          status: item.status,
+          problem: item.problem,
+          totalBytes: live?.totalBytes || item.totalBytes || 0,
+          bytesDownloaded: live?.bytesDownloaded ?? item.bytesDownloaded ?? 0,
+          speedBytesPerSec: live?.status === 'downloading' ? live.speedBytesPerSec : 0,
+          paused: live?.status === 'paused',
+          addedAt: item.addedAt,
+          finishedAt: item.finishedAt
+        }
+      })
+    }
+  }
+
+  setBridgeState(bridge: BrowserBridgeState): void {
+    this.bridge = bridge
+    this.scheduleEmit()
   }
 
   private scheduleEmit(): void {
@@ -206,7 +259,8 @@ export class DownloadQueue {
     const file = {
       version: 1,
       destinationDir: this.destinationDir || undefined,
-      items: this.items
+      // Each item's browser session is sealed (see secrets.ts), as the browser keeps its own.
+      items: this.items.map((item) => ({ ...item, context: seal(item.context) }))
     }
     this.saving = updateJson(this.filePath(), () => file).catch((error) =>
       console.error('[plexo] failed to save queue.json', error)
@@ -228,40 +282,82 @@ export class DownloadQueue {
 
   // --- adding ---------------------------------------------------------------------------------
 
-  /** Adds links to the end of the queue. A link already waiting (or downloading) is skipped. */
-  async addLinks(links: QueueLink[], options: { start: boolean }): Promise<AddLinksResult> {
+  /**
+   * Adds links to the end of the queue. A link already waiting (or downloading) is skipped. A
+   * browser link for a file whose earlier link is waiting on a fresh one — failed as expired, or
+   * not started yet — refreshes that item in place instead: it keeps its place, and what it has
+   * downloaded, and carries on from the new link.
+   */
+  async addLinks(
+    links: QueueLink[],
+    options: { source: 'paste' | 'browser'; start: boolean }
+  ): Promise<AddLinksResult> {
     await this.loaded
-    const result: AddLinksResult = { added: 0, duplicates: 0 }
+    const result: AddLinksResult = { added: 0, duplicates: 0, refreshed: 0 }
     const now = Date.now()
     for (const raw of links) {
       const link = sanitizeLink(raw)
       if (!link) continue
-      const waiting = (item: QueueItem): boolean =>
+      const pageUrl = link.pageUrl ?? link.context?.referrer
+      const pageHost = hostOf(pageUrl)
+      const linkName = nameOf(link)
+      // The same file from the same page (or, for one that expired, the same site): same name,
+      // and a page known on both sides — a name alone could be anyone's "video.mp4". Every
+      // click on a file host's download button makes a new link, so the link itself can't say.
+      const sameFile = (item: StoredItem): boolean =>
+        options.source === 'browser' &&
+        !!pageUrl &&
+        sameName(nameOf(item), linkName) &&
+        (item.pageUrl === pageUrl ||
+          (item.problem === 'expired' && pageHost !== null && hostOf(item.pageUrl) === pageHost))
+
+      const waiting = (item: StoredItem): boolean =>
         item.status === 'queued' || item.status === 'starting' || item.status === 'active'
-      if (this.items.some((item) => waiting(item) && item.url === link.url)) {
-        result.duplicates++
+      // It's in the queue already, under this link or as this file.
+      if (this.items.some((item) => waiting(item) && (item.url === link.url || sameFile(item)))) {
+        const refreshable = this.items.find(
+          (item) => item.status === 'queued' && item.url !== link.url && sameFile(item)
+        )
+        if (refreshable) {
+          this.refresh(refreshable, link, pageUrl, now)
+          result.refreshed++
+        } else {
+          result.duplicates++
+        }
         continue
       }
-      // Failed or cancelled already: that item goes again — from what it kept, if it kept
-      // anything — rather than a second one from nothing.
-      const again = this.items.find((item) => item.status === 'failed' && item.url === link.url)
+      // Failed or cancelled already, under this link or as this file: that item goes again —
+      // from what it kept, if it kept anything — rather than a second one from nothing.
+      const again = this.items.find(
+        (item) => item.status === 'failed' && (item.url === link.url || sameFile(item))
+      )
       if (again) {
+        // A link from the browser comes with a fresh session; a pasted one leaves it as it was.
+        if (options.source === 'browser') this.refresh(again, link, pageUrl, now)
+        if (isCancelled(again)) result.added++
+        else result.refreshed++
         this.requeue(again)
         again.attempts = 0
-        result.added++
         continue
       }
       if (this.items.length >= MAX_ITEMS) break
       this.items.push({
         id: randomUUID(),
         url: link.url,
+        fileName: link.fileName,
+        source: options.source,
+        pageUrl,
+        hasSession: !!link.context?.cookies?.length,
         addedAt: now,
+        linkAt: now,
         status: 'queued',
-        attempts: 0
+        totalBytes: link.totalBytes,
+        attempts: 0,
+        context: link.context
       })
       result.added++
     }
-    if (result.added > 0) {
+    if (result.added + result.refreshed > 0) {
       if (options.start) this.run()
       this.changed()
       this.startLookups()
@@ -270,7 +366,22 @@ export class DownloadQueue {
     return result
   }
 
-  private requeue(item: QueueItem): void {
+  /** Gives an item a fresher link to the same file. */
+  private refresh(
+    item: StoredItem,
+    link: QueueLink,
+    pageUrl: string | undefined,
+    now: number
+  ): void {
+    item.url = link.url
+    item.context = link.context
+    item.hasSession = !!link.context?.cookies?.length
+    item.pageUrl = pageUrl ?? item.pageUrl
+    item.linkAt = now
+    item.totalBytes ||= link.totalBytes
+  }
+
+  private requeue(item: StoredItem): void {
     item.status = 'queued'
     item.error = undefined
     item.problem = undefined
@@ -278,7 +389,7 @@ export class DownloadQueue {
     item.retryAt = undefined
   }
 
-  private finish(item: QueueItem, status: 'completed' | 'failed', failure?: Failure): void {
+  private finish(item: StoredItem, status: 'completed' | 'failed', failure?: Failure): void {
     item.status = status
     item.finishedAt = Date.now()
     item.error = failure?.error
@@ -286,15 +397,17 @@ export class DownloadQueue {
   }
 
   /**
-   * Looks up the size and name of pasted links, a couple at a time, so the list says what it
-   * holds before each one's turn. A link that plainly doesn't work is marked failed now rather
-   * than when its turn comes.
+   * Looks up the size and name of links that were pasted without them, a couple at a time, so the
+   * list says what it holds before each one's turn. A link that plainly doesn't work is marked
+   * failed now rather than when its turn comes. Browser links arrive knowing both, and a session
+   * link is best left untouched until its turn.
    */
   private startLookups(): void {
     while (this.lookingUp.size < LOOKUP_CONCURRENCY) {
       const item = this.items.find(
         (candidate) =>
           candidate.status === 'queued' &&
+          candidate.source === 'paste' &&
           candidate.totalBytes === undefined &&
           !candidate.downloadId &&
           !this.lookingUp.has(candidate.id)
@@ -308,10 +421,10 @@ export class DownloadQueue {
     }
   }
 
-  private async lookUp(item: QueueItem): Promise<void> {
+  private async lookUp(item: StoredItem): Promise<void> {
     const url = item.url
     try {
-      const probe = await probeUrl(url)
+      const { probe } = await probeWithContext(url, item.context)
       if (item.url !== url || item.status !== 'queued') return
       item.totalBytes = probe.totalBytes ?? 0
       item.fileName ||= probe.suggestedFileName
@@ -325,10 +438,16 @@ export class DownloadQueue {
     this.changed()
   }
 
-  // --- commands from the window -----------------------------------------------------------
+  // --- commands from the window and the browser -----------------------------------------------
 
-  private find(id: string): QueueItem | undefined {
+  private find(id: string): StoredItem | undefined {
     return this.items.find((item) => item.id === id)
+  }
+
+  /** The item's download, if it's the one the queue is on. */
+  private activeDownload(id: string): string | undefined {
+    const item = this.find(id)
+    return item?.status === 'active' ? item.downloadId : undefined
   }
 
   /** Sets the queue going, whatever set it off: whatever stopped it no longer stands. */
@@ -363,6 +482,33 @@ export class DownloadQueue {
     })
   }
 
+  /** Pauses an item's download, if it's the one running. The queue waits on it, paused, as it
+   * would on a download paused in the window. */
+  async pauseItem(id: string): Promise<void> {
+    await this.loaded
+    const downloadId = this.activeDownload(id)
+    if (!downloadId) return
+    await this.enqueue(async () => {
+      if ((await this.manager?.stateOf(downloadId))?.status === 'downloading') {
+        await this.manager?.pause(downloadId)
+      }
+    })
+  }
+
+  /** Resumes an item's paused download, and the queue with it. */
+  async resumeItem(id: string): Promise<void> {
+    await this.loaded
+    const downloadId = this.activeDownload(id)
+    if (!downloadId) return
+    this.run()
+    this.changed()
+    await this.enqueue(async () => {
+      if ((await this.manager?.stateOf(downloadId))?.status === 'paused') {
+        this.manager?.resume(downloadId)
+      }
+    })
+  }
+
   async retry(id: string): Promise<void> {
     await this.retryWhere((item) => item.id === id)
   }
@@ -374,7 +520,7 @@ export class DownloadQueue {
 
   /** Sends failed items back to wait their turn. A retry is asked for, not automatic: each gets
    * its own full set of attempts. */
-  private async retryWhere(which: (item: QueueItem) => boolean): Promise<void> {
+  private async retryWhere(which: (item: StoredItem) => boolean): Promise<void> {
     await this.loaded
     const failed = this.items.filter((item) => item.status === 'failed' && which(item))
     if (failed.length === 0) return
@@ -420,7 +566,7 @@ export class DownloadQueue {
   async clearFinished(): Promise<void> {
     await this.loaded
     // Done with, either way: saved, or cancelled.
-    const done = (item: QueueItem): boolean => item.status === 'completed' || isCancelled(item)
+    const done = (item: StoredItem): boolean => item.status === 'completed' || isCancelled(item)
     const finished = this.items.filter(done)
     if (finished.length === 0) return
     this.items = this.items.filter((item) => !done(item))
@@ -436,6 +582,11 @@ export class DownloadQueue {
     })
   }
 
+  openPage(id: string): void {
+    const page = this.find(id)?.pageUrl
+    if (page && /^https?:/i.test(page)) void shell.openExternal(page)
+  }
+
   async setDestination(dir: string): Promise<void> {
     if (typeof dir !== 'string' || !isAbsolute(dir)) return
     // Set before the saved queue has loaded, it would be overwritten by the saved folder.
@@ -447,7 +598,7 @@ export class DownloadQueue {
 
   // --- following the downloads ----------------------------------------------------------------
 
-  private itemFor(downloadId: string): QueueItem | undefined {
+  private itemFor(downloadId: string): StoredItem | undefined {
     return this.items.find((item) => item.downloadId === downloadId)
   }
 
@@ -489,7 +640,7 @@ export class DownloadQueue {
 
   /** Follows a download's state onto its item. Called for every update the download sends, so
    * anything more than bookkeeping only happens when its status changes. */
-  private applyState(item: QueueItem, state: Readonly<Omit<DownloadState, 'blocks'>>): void {
+  private applyState(item: StoredItem, state: Readonly<Omit<DownloadState, 'blocks'>>): void {
     item.bytesDownloaded = state.bytesDownloaded
     if (state.totalBytes > 0) item.totalBytes = state.totalBytes
     switch (state.status) {
@@ -507,6 +658,8 @@ export class DownloadQueue {
       case 'completed':
         if (item.status === 'completed') return
         this.finish(item, 'completed')
+        // Its browser session did its job: nothing needs it any more, so it isn't kept.
+        item.context = undefined
         item.finishedAt = state.completedAt ?? item.finishedAt
         item.destinationPath = state.destinationPath
         item.fileName = state.fileName
@@ -539,7 +692,7 @@ export class DownloadQueue {
 
   /** Marks an item failed — or, for a failure a moment could fix that hasn't used up its
    * attempts, has it wait a moment for another go (see AUTO_RETRY_DELAY_MS). */
-  private fail(item: QueueItem, failure: Failure): void {
+  private fail(item: StoredItem, failure: Failure): void {
     if (failure.retry && item.attempts < MAX_AUTO_ATTEMPTS) {
       this.requeue(item)
       item.retryAt = Date.now() + AUTO_RETRY_DELAY_MS
@@ -636,7 +789,7 @@ export class DownloadQueue {
     this.changed()
 
     try {
-      const probe = await probeUrl(item.url)
+      const { probe, context } = await probeWithContext(item.url, item.context)
       if (!this.items.includes(item)) return // removed meanwhile
       if (!this.running) {
         // Paused while the link was being checked: it waits, not started.
@@ -645,22 +798,25 @@ export class DownloadQueue {
         this.changed()
         return
       }
-      // What a file host sends once a link has run out: its own page.
+      // What a file host sends once a session link has run out: its own page.
       if (probe.contentType?.startsWith('text/html') && !probe.attachment) {
         throw new LinkExpiredError(
-          'The link opened a web page instead of the file, so it has probably expired.'
+          'The link opened a web page instead of the file, so it has probably expired. Get a fresh link from its page.'
         )
       }
 
       if (item.downloadId) {
-        const resumed = await manager.resumeParked(item.downloadId, { url: probe.finalUrl })
+        const resumed = await manager.resumeParked(item.downloadId, {
+          url: probe.finalUrl,
+          context
+        })
         if (resumed) {
           item.status = 'active'
           this.changed()
           return
         }
-        // Nothing to resume from after all — its partial file went missing, or where the link
-        // leads now serves another file: start over from this link.
+        // Nothing to resume from after all — its partial file went missing, or the new link
+        // serves another file: start over from this link.
         const stale = item.downloadId
         item.downloadId = undefined
         await manager.remove(stale)
@@ -669,12 +825,16 @@ export class DownloadQueue {
       const downloadId = await manager.start({
         url: probe.finalUrl,
         destinationDir: this.destinationDir,
-        suggestedFileName: probe.suggestedFileName,
+        // The server's own name for the file wins: what a browser reports may be its own
+        // variant ("file (1).zip" for a name its downloads folder already had).
+        suggestedFileName:
+          (probe.attachment && probe.suggestedFileName) || item.fileName || probe.suggestedFileName,
         totalBytes: probe.totalBytes ?? 0,
         supportsRanges: probe.supportsRanges && probe.totalBytes !== null,
         interfaceIds,
         etag: probe.etag,
         lastModified: probe.lastModified,
+        context,
         queueItemId: item.id
       })
       if (!this.items.includes(item)) {

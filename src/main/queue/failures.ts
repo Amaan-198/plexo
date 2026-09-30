@@ -13,9 +13,10 @@ export interface Failure {
 /** A link that stopped leading to the file: nothing but a fresh one will help. */
 export class LinkExpiredError extends Error {}
 
-const EXPIRED_MESSAGE = 'Link expired or no longer leads to the file.'
+const EXPIRED_MESSAGE =
+  'Link expired or no longer leads to the file. A fresh link from its page picks up where it stopped.'
 
-/** Statuses a link that stopped working answers with: one that ran out or was never allowed
+/** Statuses a link that stopped working answers with: a file host's session link that ran out
  * (401, 403), or one whose file is gone (404, 410). */
 const EXPIRED_STATUSES = new Set([401, 403, 404, 410])
 

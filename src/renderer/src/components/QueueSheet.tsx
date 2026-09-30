@@ -6,6 +6,8 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Cookie,
+  ExternalLink,
   FolderOpen,
   Link2Off,
   ListPlus,
@@ -16,9 +18,11 @@ import {
   RotateCw,
   X
 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { formatBytes, formatEta, formatSpeed, toDisplayPath } from '../utils/format'
 import { FileNameText } from './FileNameText'
+import { ScreenFooter } from './ScreenFooter'
 import { QueueDestination } from './QueueDestination'
 import { Button } from './ui/button'
 import { Sheet, SheetClose, SheetContent, SheetDescription, SheetTitle } from './ui/sheet'
@@ -26,6 +30,16 @@ import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 
 function command(command: Parameters<typeof window.plexo.queueCommand>[0]): void {
   void window.plexo.queueCommand(command).catch(() => {})
+}
+
+/** "3m ago" — how old a captured link is, which is what decides whether it still works. */
+function formatAge(ms: number): string {
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
 }
 
 function hostOf(url: string | undefined): string | null {
@@ -201,7 +215,7 @@ function kept(item: QueueItem): string | null {
 }
 
 /** The line under an item's name: where it's at, in a few words. */
-function statusLine(item: QueueItem, live: DownloadState | null): React.ReactNode {
+function statusLine(item: QueueItem, live: DownloadState | null, now: number): React.ReactNode {
   const size = item.totalBytes ? formatBytes(item.totalBytes) : null
   switch (item.status) {
     case 'queued': {
@@ -209,8 +223,9 @@ function statusLine(item: QueueItem, live: DownloadState | null): React.ReactNod
       if (size) parts.push(size)
       const progress = kept(item)
       if (progress) parts.push(progress)
-      const host = hostOf(item.url)
-      if (host) parts.push(host)
+      const host = hostOf(item.pageUrl) ?? hostOf(item.url)
+      if (item.source === 'browser') parts.push(`link ${formatAge(now - item.linkAt)}`)
+      else if (host) parts.push(host)
       return parts.join(' · ')
     }
     case 'starting':
@@ -243,6 +258,7 @@ function QueueRow({
   position,
   waitingCount,
   live,
+  now,
   homeDir
 }: {
   item: QueueItem
@@ -250,6 +266,7 @@ function QueueRow({
   position: number
   waitingCount: number
   live: DownloadState | null
+  now: number
   homeDir: string
 }): React.JSX.Element {
   const expired = item.status === 'failed' && item.problem === 'expired'
@@ -276,6 +293,22 @@ function QueueRow({
             tooltipText={item.destinationPath ? toDisplayPath(item.destinationPath, homeDir) : name}
             className="min-w-0 font-sans text-[12.5px] font-semibold text-foreground"
           />
+          {item.hasSession && item.status !== 'completed' && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span
+                    tabIndex={0}
+                    aria-label="Uses your browser session"
+                    className="flex shrink-0 items-center rounded-sm text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                  >
+                    <Cookie className="size-3" aria-hidden="true" />
+                  </span>
+                }
+              />
+              <TooltipContent>Sent with your browser session’s cookies</TooltipContent>
+            </Tooltip>
+          )}
         </div>
         <div
           className={cn(
@@ -287,7 +320,7 @@ function QueueRow({
               : 'truncate text-muted-foreground'
           )}
         >
-          {statusLine(item, live)}
+          {statusLine(item, live, now)}
         </div>
         {(item.status === 'active' || item.status === 'starting') && (
           <div className="mt-[7px] h-[3px] overflow-hidden rounded-full bg-muted">
@@ -305,6 +338,18 @@ function QueueRow({
               />
             )}
           </div>
+        )}
+        {expired && item.pageUrl && (
+          <Button
+            type="button"
+            variant="secondary"
+            size="xs"
+            onClick={() => command({ kind: 'openPage', id: item.id })}
+            className="mt-2 font-mono text-[10px] tracking-wide uppercase"
+          >
+            <ExternalLink data-icon="inline-start" />
+            Get a new link
+          </Button>
         )}
       </div>
       {/* Actions show on hover or keyboard focus, so a long list stays quiet to read. */}
@@ -391,6 +436,44 @@ function Summary({ queue }: { queue: QueueState }): React.JSX.Element {
   )
 }
 
+function BridgeStatus({ queue }: { queue: QueueState }): React.JSX.Element {
+  const { bridge } = queue
+  const address = `127.0.0.1:${bridge.port}`
+  const [dot, text] =
+    bridge.status === 'error'
+      ? ['bg-[var(--color-danger)]', bridge.error ?? 'The browser extension can’t reach Plexo']
+      : bridge.status === 'starting'
+        ? ['bg-[var(--color-neutral)]', 'Starting…']
+        : bridge.pairedCount > 0
+          ? [
+              'bg-[var(--color-wifi)]',
+              `${bridge.pairedCount === 1 ? 'Browser' : `${bridge.pairedCount} browsers`} connected · ${address}`
+            ]
+          : ['bg-[var(--color-neutral)]', `No browser connected yet · ${address}`]
+  return (
+    <ScreenFooter className="min-h-11 gap-2.5 px-4 py-2.5">
+      <div className={cn('size-1.5 shrink-0 rounded-full', dot)} aria-hidden="true" />
+      <div className="min-w-0 flex-1 font-mono text-[10.5px] leading-[1.35] text-muted-foreground">
+        <span className="font-semibold tracking-[0.1em] text-[var(--text-secondary)] uppercase">
+          Browser
+        </span>{' '}
+        · {text}
+      </div>
+      {bridge.pairedCount > 0 && (
+        <Button
+          type="button"
+          variant="link"
+          size="xs"
+          className="h-auto shrink-0 px-0 font-mono text-[10.5px]"
+          onClick={() => command({ kind: 'forgetBrowsers' })}
+        >
+          Disconnect
+        </Button>
+      )}
+    </ScreenFooter>
+  )
+}
+
 function EmptyState({ onAdd }: { onAdd: () => void }): React.JSX.Element {
   return (
     <div className="flex flex-1 animate-[plexo-row-in_260ms_ease-out] flex-col items-center justify-center gap-3 px-8 text-center">
@@ -400,7 +483,8 @@ function EmptyState({ onAdd }: { onAdd: () => void }): React.JSX.Element {
       <div className="flex flex-col gap-1.5">
         <div className="font-sans text-[14px] font-semibold text-foreground">Nothing queued</div>
         <p className="font-sans text-[12px] leading-[1.5] text-[var(--text-secondary)]">
-          Paste several links at once. Files download one after another, each over every network.
+          Paste several links at once, or start a download in your browser with the Plexo extension
+          installed. Files download one after another, each over every network.
         </p>
       </div>
       <Button type="button" size="sm" onClick={onAdd}>
@@ -418,6 +502,16 @@ export function QueueSheet(): React.JSX.Element {
   const openAddLinks = useAppStore((store) => store.openAddLinks)
   const currentDownload = useAppStore((store) => store.currentDownload)
   const homeDir = useAppStore((store) => store.homeDir)
+
+  // Ages ("link 3m ago") move on while the panel is open.
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!open) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 30_000)
+    return () => clearInterval(timer)
+  }, [open])
 
   const items = queue?.items ?? []
   const failed = items.filter(isFailure).length
@@ -578,12 +672,15 @@ export function QueueSheet(): React.JSX.Element {
                       ? currentDownload
                       : null
                   }
+                  now={now}
                   homeDir={homeDir}
                 />
               )
             })}
           </ul>
         )}
+
+        {queue && <BridgeStatus queue={queue} />}
       </SheetContent>
     </Sheet>
   )

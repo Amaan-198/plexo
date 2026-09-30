@@ -245,7 +245,7 @@
   }
 }
 
-/* A queue row arriving: a short rise into place, so a link added while it is open is noticed
+/* A queue row arriving: a short rise into place, so a link added from the browser is noticed
    without the list jumping. */
 @keyframes plexo-row-in {
   from {
