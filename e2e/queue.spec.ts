@@ -1,0 +1,312 @@
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import type { QueueItem, QueueState } from '../src/shared/types'
+import { expect, LAN_ADDRESS, test, type PlexoApp } from './fixtures'
+import { sha256, type Origin } from './origin'
+
+// Q. The download queue: links downloaded one after another, through the same download
+// machinery as a single download.
+
+async function queueOf(plexo: PlexoApp): Promise<QueueState> {
+  return plexo.api.getQueue()
+}
+
+/** Waits until the queue matches `predicate`; a timeout says what it looked like instead. */
+async function waitForQueue(
+  plexo: PlexoApp,
+  predicate: (queue: QueueState) => boolean,
+  timeout = 30_000
+): Promise<QueueState> {
+  const deadline = Date.now() + timeout
+  let queue: QueueState | null = null
+  while (Date.now() < deadline) {
+    queue = await queueOf(plexo)
+    if (predicate(queue)) return queue
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  const items = queue?.items.map(
+    (item) => `${item.fileName ?? item.url}:${item.status}${item.error ? ` (${item.error})` : ''}`
+  )
+  throw new Error(`Timed out waiting on the queue. Last seen: [${items?.join(', ')}]`)
+}
+
+const allDone = (queue: QueueState): boolean =>
+  queue.items.length > 0 &&
+  queue.items.every((item) => item.status === 'completed' || item.status === 'failed')
+
+async function expectSavedAs(item: QueueItem, origin: Origin): Promise<void> {
+  expect(item.status, `${item.fileName}: ${item.error ?? ''}`).toBe('completed')
+  expect(sha256(await readFile(item.destinationPath!)), `${item.fileName} matches`).toBe(
+    origin.sha256
+  )
+}
+
+// Every file the queue saves lands in the test's own folder, not the user's Downloads.
+test.beforeEach(async ({ plexo }) => {
+  await plexo.api.queueCommand({ kind: 'setDestination', dir: plexo.dirs.dest })
+})
+
+// However a test ends, no download's staging file is left behind in the destination.
+test.afterEach(async ({ plexo }) => {
+  const staging = async (): Promise<string[]> =>
+    (await readdir(plexo.dirs.dest)).filter((name) => name.endsWith('.plexo'))
+  await expect.poll(staging, { message: 'no staging files left behind' }).toEqual([])
+})
+
+test.describe('download queue @smoke', () => {
+  test('pasted links download one after another, into one folder', async ({ plexo, serve }) => {
+    const origins = await Promise.all(
+      [1, 2, 3].map((seed) => serve({ size: 600 * 1024, seed, bytesPerSecond: 3_000_000 }))
+    )
+    const urls = origins.map((origin, index) => origin.url(`/files/part${index + 1}.bin`))
+
+    const added = await plexo.api.addToQueue(
+      urls.map((url) => ({ url })),
+      { start: true }
+    )
+    expect(added).toEqual({ added: 3, duplicates: 0 })
+    // The same links again are already there.
+    expect(await plexo.api.addToQueue([{ url: urls[0] }], { start: true })).toMatchObject({
+      added: 0,
+      duplicates: 1
+    })
+
+    const queue = await waitForQueue(plexo, allDone)
+    expect(queue.items.map((item) => item.fileName)).toEqual([
+      'part1.bin',
+      'part2.bin',
+      'part3.bin'
+    ])
+    for (const [index, item] of queue.items.entries()) await expectSavedAs(item, origins[index])
+
+    // One at a time: each file's transfer only began once the one before it had finished.
+    for (let index = 1; index < origins.length; index++) {
+      const previousLast = Math.max(...origins[index - 1].chunkRequests().map((r) => r.at))
+      const nextFirst = Math.min(...origins[index].chunkRequests().map((r) => r.at))
+      expect(nextFirst, `part${index + 1} waited for part${index}`).toBeGreaterThanOrEqual(
+        previousLast
+      )
+    }
+  })
+
+  test('a link that stopped working fails clearly, and the queue moves on', async ({
+    plexo,
+    serve
+  }) => {
+    const gone = await serve({ size: 64 * 1024 })
+    gone.setRule(() => ({ status: 403 }))
+    const page = await serve({ size: 64 * 1024 })
+    page.setRule(() => ({ status: 200, headers: { 'Content-Type': 'text/html' } }))
+    const good = await serve({ size: 300 * 1024, seed: 7 })
+
+    await plexo.api.addToQueue(
+      [
+        { url: gone.url('/files/gone.bin') },
+        { url: page.url('/files/page.bin') },
+        { url: good.url('/files/good.bin') }
+      ],
+      { start: true }
+    )
+    const queue = await waitForQueue(plexo, allDone)
+    const [first, second, third] = queue.items
+    expect(first).toMatchObject({ status: 'failed', problem: 'expired' })
+    expect(second).toMatchObject({ status: 'failed', problem: 'expired' })
+    expect(second.error).toContain('web page')
+    await expectSavedAs(third, good)
+  })
+
+  test('a relaunch brings the queue back stopped, and it carries on from there', async ({
+    plexo,
+    serve
+  }) => {
+    const slow = await serve({ size: 1024 * 1024, seed: 3, bytesPerSecond: 100_000 })
+    const next = await serve({ size: 200 * 1024, seed: 4 })
+    await plexo.api.addToQueue(
+      [{ url: slow.url('/files/slow.bin') }, { url: next.url('/files/next.bin') }],
+      { start: true }
+    )
+    await waitForQueue(plexo, (queue) =>
+      queue.items.some((item) => item.status === 'active' && (item.bytesDownloaded ?? 0) > 0)
+    )
+
+    await plexo.relaunch()
+    const restored = await waitForQueue(plexo, (queue) => queue.items.length === 2)
+    expect(restored.running).toBe(false)
+    expect(restored.items.map((item) => item.status)).toEqual(['active', 'queued'])
+    expect((await plexo.current())?.status).toBe('paused')
+
+    await plexo.api.queueCommand({ kind: 'start' })
+    const queue = await waitForQueue(plexo, allDone)
+    await expectSavedAs(queue.items[0], slow)
+    await expectSavedAs(queue.items[1], next)
+  })
+})
+
+test.describe('queue safety', () => {
+  test('a saved queue that can’t be read is reported, and never saved over', async ({
+    plexo,
+    serve,
+    dirs
+  }) => {
+    await plexo.quit()
+    // Something that isn't a readable file where queue.json goes, as a lock would make it.
+    const path = join(dirs.userData, 'queue.json')
+    await rm(path, { force: true })
+    await mkdir(path)
+    await plexo.launch()
+    await plexo.api.queueCommand({ kind: 'setDestination', dir: dirs.dest })
+
+    const queue = await waitForQueue(plexo, (state) => !!state.loadError, 10_000)
+    expect(queue.loadError).toMatch(/couldn’t read its saved queue/)
+    // The queue still works for this session…
+    const origin = await serve({ size: 100 * 1024, seed: 51 })
+    await plexo.api.addToQueue([{ url: origin.url('/files/session.bin') }], { start: true })
+    const [item] = (await waitForQueue(plexo, allDone)).items
+    await expectSavedAs(item, origin)
+    // In the folder picked while the queue was still loading, not the default one.
+    expect(dirname(item.destinationPath!)).toBe(dirs.dest)
+    // …but what's there is left as it was.
+    expect((await stat(path)).isDirectory()).toBe(true)
+  })
+
+  test('a change made just before quitting is saved', async ({ plexo, serve }) => {
+    const origin = await serve({ size: 64 * 1024, seed: 52 })
+    await plexo.api.addToQueue([{ url: origin.url('/files/late.bin') }], { start: false })
+    await plexo.quit()
+    await plexo.launch()
+    const queue = await waitForQueue(plexo, (state) => state.items.length > 0, 10_000)
+    expect(queue.items.map((item) => item.url)).toEqual([origin.url('/files/late.bin')])
+  })
+
+  test('a download started just before quitting is found again, not started twice', async ({
+    plexo,
+    serve,
+    dirs
+  }) => {
+    const origin = await serve({ size: 1024 * 1024, seed: 53, bytesPerSecond: 100_000 })
+    await plexo.api.addToQueue([{ url: origin.url('/files/once.bin') }], { start: true })
+    await waitForQueue(plexo, (queue) => (queue.items[0]?.bytesDownloaded ?? 0) > 0)
+    await plexo.quit()
+
+    // As if the app had quit before the queue could note which download was its item's.
+    const path = join(dirs.userData, 'queue.json')
+    const saved = JSON.parse(await readFile(path, 'utf-8'))
+    saved.items[0].status = 'queued'
+    delete saved.items[0].downloadId
+    await writeFile(path, JSON.stringify(saved))
+
+    await plexo.launch()
+    const restored = await waitForQueue(plexo, (queue) => queue.items[0]?.status === 'active')
+    expect(restored.items[0].downloadId).toBe((await plexo.current())?.id)
+    await plexo.api.queueCommand({ kind: 'start' })
+    await expectSavedAs((await waitForQueue(plexo, allDone)).items[0], origin)
+    expect(await readdir(dirs.dest)).toEqual(['once.bin'])
+  })
+
+  test('removing an old download never touches the staging file of a new one by the same name', async ({
+    plexo,
+    serve,
+    dirs
+  }) => {
+    const first = await serve({ size: 64 * 1024, seed: 54 })
+    const oldId = await plexo.start(first.url('/files/same.bin'), first.sha256)
+    await plexo.waitForStatus('completed')
+    // The finished file is deleted, so the name is free for the next download of it.
+    await rm(join(dirs.dest, 'same.bin'))
+
+    const second = await serve({ size: 1024 * 1024, seed: 55, bytesPerSecond: 150_000 })
+    await plexo.api.addToQueue([{ url: second.url('/other/same.bin') }], { start: true })
+    await waitForQueue(plexo, (queue) => (queue.items[0]?.bytesDownloaded ?? 0) > 0)
+    await plexo.api.removeDownload(oldId)
+
+    await expectSavedAs((await waitForQueue(plexo, allDone)).items[0], second)
+  })
+
+  test('a failure is classified by what the server answered, not by its wording', async ({
+    plexo,
+    serve
+  }) => {
+    // Both answer the probe, then send a 200 where the file's bytes should be: one a web page
+    // (a link that stopped working), one not (a server that stopped serving parts).
+    const page = await serve({ size: 256 * 1024, seed: 56 })
+    page.setRule((request) =>
+      request.range && request.range.end !== 0
+        ? { status: 200, headers: { 'Content-Type': 'text/html' } }
+        : undefined
+    )
+    const whole = await serve({ size: 256 * 1024, seed: 57 })
+    whole.setRule((request) =>
+      request.range && request.range.end !== 0 ? { status: 200 } : undefined
+    )
+    await plexo.api.addToQueue(
+      [{ url: page.url('/files/page.bin') }, { url: whole.url('/files/whole.bin') }],
+      { start: true }
+    )
+    const queue = await waitForQueue(plexo, allDone, 60_000)
+    const byName = (name: string): QueueItem | undefined =>
+      queue.items.find((item) => item.url.endsWith(name))
+    expect(byName('page.bin')).toMatchObject({ status: 'failed', problem: 'expired' })
+    // Not the link's fault: it got its automatic second try before failing.
+    expect(byName('whole.bin')).toMatchObject({ status: 'failed', problem: 'other', attempts: 2 })
+  })
+
+  test('the queue starts downloads only on the networks left on at the start screen', async ({
+    plexo,
+    serve
+  }) => {
+    test.skip(!LAN_ADDRESS, 'Needs a second network')
+    await plexo.api.updateSettings({ excludedNetworks: ['b'] })
+    const origin = await serve({ size: 512 * 1024, seed: 58 })
+    await plexo.api.addToQueue([{ url: origin.url('/files/one-network.bin') }], { start: true })
+    await expectSavedAs((await waitForQueue(plexo, allDone)).items[0], origin)
+    const froms = new Set(origin.chunkRequests().map((request) => request.from))
+    expect([...froms]).toEqual(['127.0.0.1'])
+  })
+
+  test('a retry whose link now leads elsewhere resumes only if it serves the same bytes', async ({
+    plexo,
+    serve
+  }) => {
+    // Same size, no ETag or Last-Modified: nothing in the headers tells the files apart.
+    const size = 1536 * 1024
+    const first = await serve({ size, seed: 63, etag: null, bytesPerSecond: 150_000 })
+    const other = await serve({ size, seed: 64, etag: null })
+    // Each link redirects to where the file is now; the first place stops serving it midway.
+    const expired = new Set<string>()
+    let target = (name: string): string => `/old/${name}`
+    first.setRule(({ path }) => {
+      if (path.startsWith('/start/')) return { redirect: target(path.slice('/start/'.length)) }
+      return expired.has(path) ? { status: 403 } : undefined
+    })
+    await plexo.api.addToQueue(
+      [{ url: first.url('/start/same.bin') }, { url: first.url('/start/swapped.bin') }],
+      { start: true }
+    )
+    for (const [index, name] of ['same.bin', 'swapped.bin'].entries()) {
+      await waitForQueue(plexo, (queue) => (queue.items[index]?.bytesDownloaded ?? 0) > size / 4)
+      expired.add(`/old/${name}`)
+      await waitForQueue(plexo, (queue) => queue.items[index]?.status === 'failed')
+    }
+    const failed = await queueOf(plexo)
+    for (const item of failed.items) expect(item).toMatchObject({ problem: 'expired' })
+    const kept = failed.items[0].bytesDownloaded ?? 0
+    expect(kept).toBeGreaterThan(0)
+
+    // Now the same file is served from a new place — and the other link leads to another file.
+    target = (name) => (name === 'same.bin' ? `/new/${name}` : other.url(`/new/${name}`))
+    await plexo.api.queueCommand({ kind: 'retryFailed' })
+    const queue = await waitForQueue(
+      plexo,
+      (state) => allDone(state) && state.items.every((item) => item.status === 'completed')
+    )
+    await expectSavedAs(queue.items[0], first)
+    // Resumed: the new place only served what was missing.
+    const fetchedAgain = first
+      .chunkRequests()
+      .filter((request) => request.path.startsWith('/new/'))
+      .reduce((sum, request) => sum + request.bytesSent, 0)
+    expect(fetchedAgain).toBeLessThanOrEqual(size - kept + 256 * 1024)
+    // Compared with what was on disk, found different, and started over.
+    await expectSavedAs(queue.items[1], other)
+  })
+})
