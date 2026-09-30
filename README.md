@@ -261,7 +261,7 @@ npm run dev
 
 Paste several links into the link field (or use **Add several links** on the start screen) and they go to the queue, opened from the list icon in the title bar. Files download **one at a time** — a single file already has every network to itself — into the queue's folder, over the networks left on at the start screen.
 
-- **Failures**: a failure that isn't the link's fault gets one automatic retry; anything else waits for **Retry**, which picks up where it stopped — once Plexo has checked that the link still serves the same bytes, if it now leads somewhere else.
+- **Failures**: a failure a moment could fix (a busy server, a dropped connection) is retried once, a few seconds later; anything else waits for **Retry**, which picks up where it stopped. With no network connected the queue waits for one, and a save folder it can't write to (gone, read-only, full) pauses it with the reason, rather than failing every file in turn.
 - **Expired links**: a link answering `401`/`403`/`404`/`410`, or with a web page instead of the file, is marked _expired_ rather than retried.
 - **Relaunch**: the queue comes back **stopped**, with its current download paused. **Resume queue** carries on.
 - One notification when the queue runs out, rather than one per file.

@@ -192,13 +192,23 @@ function StatusGlyph({
   }
 }
 
+/** How much of a waiting or failed item is already on disk, for its retry to pick up from. */
+function kept(item: QueueItem): string | null {
+  if (!item.downloadId || !item.bytesDownloaded) return null
+  return item.totalBytes
+    ? `${Math.min(99, Math.floor((item.bytesDownloaded / item.totalBytes) * 100))}% kept`
+    : `${formatBytes(item.bytesDownloaded)} kept`
+}
+
 /** The line under an item's name: where it's at, in a few words. */
 function statusLine(item: QueueItem, live: DownloadState | null): React.ReactNode {
   const size = item.totalBytes ? formatBytes(item.totalBytes) : null
   switch (item.status) {
     case 'queued': {
-      const parts = ['Waiting']
+      const parts = [item.retryAt ? 'Retrying shortly' : 'Waiting']
       if (size) parts.push(size)
+      const progress = kept(item)
+      if (progress) parts.push(progress)
       const host = hostOf(item.url)
       if (host) parts.push(host)
       return parts.join(' · ')
@@ -224,7 +234,7 @@ function statusLine(item: QueueItem, live: DownloadState | null): React.ReactNod
     case 'completed':
       return [size, 'Saved'].filter(Boolean).join(' · ')
     case 'failed':
-      return item.error ?? 'Failed'
+      return [kept(item), item.error ?? 'Failed'].filter(Boolean).join(' · ')
   }
 }
 
@@ -533,6 +543,12 @@ export function QueueSheet(): React.JSX.Element {
                 : 'Its progress is on the main screen.'}
             </QueueNotice>
           )}
+          {queue?.waitingForNetwork && (
+            <QueueNotice>
+              No network is connected. The queue carries on as soon as one is.
+            </QueueNotice>
+          )}
+          {queue?.stoppedBecause && <QueueNotice>{queue.stoppedBecause}</QueueNotice>}
           {queue?.blocked && (
             <QueueNotice>
               Your current download failed. Resume it, or start a new download, and the queue
