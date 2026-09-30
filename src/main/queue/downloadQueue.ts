@@ -12,7 +12,7 @@ import type {
   QueueLink,
   QueueState
 } from '../../shared/types'
-import { nameOf } from '../../shared/queueItemName'
+import { isCancelled, isFailure, nameOf } from '../../shared/queueItem'
 import type { DownloadEvent, DownloadManager } from '../download/downloadManager'
 import { probeUrl } from '../download/probe'
 import { readJson, updateJson } from '../jsonFile'
@@ -242,6 +242,15 @@ export class DownloadQueue {
         result.duplicates++
         continue
       }
+      // Failed or cancelled already: that item goes again — from what it kept, if it kept
+      // anything — rather than a second one from nothing.
+      const again = this.items.find((item) => item.status === 'failed' && item.url === link.url)
+      if (again) {
+        this.requeue(again)
+        again.attempts = 0
+        result.added++
+        continue
+      }
       if (this.items.length >= MAX_ITEMS) break
       this.items.push({
         id: randomUUID(),
@@ -353,8 +362,9 @@ export class DownloadQueue {
     await this.retryWhere((item) => item.id === id)
   }
 
+  /** Retries every item that failed — not those the user cancelled. */
   async retryFailed(): Promise<void> {
-    await this.retryWhere(() => true)
+    await this.retryWhere(isFailure)
   }
 
   /** Sends failed items back to wait their turn. A retry is asked for, not automatic: each gets
@@ -405,9 +415,11 @@ export class DownloadQueue {
 
   async clearFinished(): Promise<void> {
     await this.loaded
-    const finished = this.items.filter((item) => item.status === 'completed')
+    // Done with, either way: saved, or cancelled.
+    const done = (item: QueueItem): boolean => item.status === 'completed' || isCancelled(item)
+    const finished = this.items.filter(done)
     if (finished.length === 0) return
-    this.items = this.items.filter((item) => item.status !== 'completed')
+    this.items = this.items.filter((item) => !done(item))
     this.changed()
     await this.enqueue(async () => {
       const current = await this.manager?.currentState()
@@ -529,8 +541,11 @@ export class DownloadQueue {
       item.retryAt = Date.now() + AUTO_RETRY_DELAY_MS
     } else {
       this.finish(item, 'failed', failure)
-      this.session.failed++
-      this.session.lastName = nameOf(item)
+      // Cancelling is the user's choice, not a failure to report.
+      if (failure.problem !== 'cancelled') {
+        this.session.failed++
+        this.session.lastName = nameOf(item)
+      }
     }
     this.changed()
   }
